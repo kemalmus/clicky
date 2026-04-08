@@ -37,7 +37,7 @@ If you want to do it yourself, here's the deal.
 - Xcode 15+
 - Node.js 18+ (for the Cloudflare Worker)
 - A [Cloudflare](https://cloudflare.com) account (free tier works)
-- API keys for: [Anthropic](https://console.anthropic.com), [AssemblyAI](https://www.assemblyai.com), [ElevenLabs](https://elevenlabs.io)
+- API keys for: [Anthropic](https://console.anthropic.com) or [OpenRouter](https://openrouter.ai), [AssemblyAI](https://www.assemblyai.com), [ElevenLabs](https://elevenlabs.io)
 
 ### 1. Set up the Cloudflare Worker
 
@@ -52,9 +52,12 @@ Now add your secrets. Wrangler will prompt you to paste each one:
 
 ```bash
 npx wrangler secret put ANTHROPIC_API_KEY
+npx wrangler secret put OPENROUTER_API_KEY
 npx wrangler secret put ASSEMBLYAI_API_KEY
 npx wrangler secret put ELEVENLABS_API_KEY
 ```
+
+`/chat-openrouter` is the default LLM route used by the app. `/chat` uses Anthropic directly. Set `OPENROUTER_API_KEY` for the default path, and optionally set `OPENROUTER_API_URL` in `wrangler.toml` if you need a non-default upstream URL.
 
 For the ElevenLabs voice ID, open `wrangler.toml` and set it there (it's not sensitive):
 
@@ -84,6 +87,7 @@ This starts a local server (usually `http://localhost:8787`) that behaves exactl
 
 ```
 ANTHROPIC_API_KEY=sk-ant-...
+OPENROUTER_API_KEY=sk-or-...
 ASSEMBLYAI_API_KEY=...
 ELEVENLABS_API_KEY=...
 ELEVENLABS_VOICE_ID=...
@@ -100,8 +104,10 @@ grep -r "clicky-proxy" leanring-buddy/
 ```
 
 You'll find it in:
-- `CompanionManager.swift` — Claude chat + ElevenLabs TTS
+- `CompanionManager.swift` — chat + ElevenLabs TTS
 - `AssemblyAIStreamingTranscriptionProvider.swift` — AssemblyAI token endpoint
+
+The app now defaults to `ChatProxyPath = /chat-openrouter`. If you want Anthropic directly instead, set `ChatProxyPath` in `leanring-buddy/Info.plist` to `/chat`.
 
 ### 4. Open in Xcode and run
 
@@ -141,7 +147,7 @@ leanring-buddy/          # Swift source (yes, the typo stays)
   AssemblyAI*.swift         # Real-time transcription
   BuddyDictation*.swift     # Push-to-talk pipeline
 worker/                  # Cloudflare Worker proxy
-  src/index.ts              # Three routes: /chat, /tts, /transcribe-token
+  src/index.ts              # Four routes: /chat, /chat-openrouter, /tts, /transcribe-token
 CLAUDE.md                # Full architecture doc (agents read this)
 ```
 
