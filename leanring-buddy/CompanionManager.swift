@@ -71,9 +71,13 @@ final class CompanionManager: ObservableObject {
     /// Base URL for the Cloudflare Worker proxy. All API requests route
     /// through this so keys never ship in the app binary.
     private static let workerBaseURL = "https://your-worker-name.your-subdomain.workers.dev"
+    /// Worker chat route to use for AI responses.
+    /// Defaults to OpenRouter (`/chat-openrouter`). Set `ChatProxyPath` in
+    /// Info.plist to `/chat` to route requests through Anthropic directly.
+    private static let workerChatProxyPath = AppBundleConfiguration.stringValue(forKey: "ChatProxyPath") ?? "/chat-openrouter"
 
     private lazy var claudeAPI: ClaudeAPI = {
-        return ClaudeAPI(proxyURL: "\(Self.workerBaseURL)/chat", model: selectedModel)
+        return ClaudeAPI(proxyURL: "\(Self.workerBaseURL)\(Self.workerChatProxyPath)", model: selectedModel)
     }()
 
     private lazy var elevenLabsTTSClient: ElevenLabsTTSClient = {
@@ -575,6 +579,7 @@ final class CompanionManager: ObservableObject {
     - user asks how to commit in xcode: "see that source control menu up top? click that and hit commit, or you can use command option c as a shortcut. [POINT:285,11:source control]"
     - element is on screen 2 (not where cursor is): "that's over on your other monitor — see the terminal window? [POINT:400,300:terminal:screen2]"
     """
+    private static let maxLLMStreamingAttempts = 3
 
     // MARK: - AI Response Pipeline
 
@@ -610,14 +615,10 @@ final class CompanionManager: ObservableObject {
                     (userPlaceholder: entry.userTranscript, assistantResponse: entry.assistantResponse)
                 }
 
-                let (fullResponseText, _) = try await claudeAPI.analyzeImageStreaming(
-                    images: labeledImages,
-                    systemPrompt: Self.companionVoiceResponseSystemPrompt,
-                    conversationHistory: historyForAPI,
-                    userPrompt: transcript,
-                    onTextChunk: { _ in
-                        // No streaming text display — spinner stays until TTS plays
-                    }
+                let fullResponseText = try await requestLLMStreamingResponseWithRetry(
+                    labeledImages: labeledImages,
+                    historyForAPI: historyForAPI,
+                    transcript: transcript
                 )
 
                 guard !Task.isCancelled else { return }
@@ -753,6 +754,79 @@ final class CompanionManager: ObservableObject {
             overlayWindowManager.fadeOutAndHideOverlay()
             isOverlayVisible = false
         }
+    }
+
+    /// Requests a streaming LLM response and retries automatically when the
+    /// failure looks transient (network hiccup, upstream timeout, 5xx, 429).
+    /// Keeping retries here prevents short-lived edge failures from forcing
+    /// users to repeat their whole push-to-talk interaction.
+    private func requestLLMStreamingResponseWithRetry(
+        labeledImages: [(data: Data, label: String)],
+        historyForAPI: [(userPlaceholder: String, assistantResponse: String)],
+        transcript: String
+    ) async throws -> String {
+        var currentAttempt = 1
+
+        while true {
+            do {
+                let (fullResponseText, _) = try await claudeAPI.analyzeImageStreaming(
+                    images: labeledImages,
+                    systemPrompt: Self.companionVoiceResponseSystemPrompt,
+                    conversationHistory: historyForAPI,
+                    userPrompt: transcript,
+                    onTextChunk: { _ in
+                        // No streaming text display — spinner stays until TTS plays
+                    }
+                )
+                return fullResponseText
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                let hasRemainingRetryAttempts = currentAttempt < Self.maxLLMStreamingAttempts
+                let shouldRetryRequest = hasRemainingRetryAttempts && shouldRetryLLMStreamingRequest(for: error)
+
+                guard shouldRetryRequest else {
+                    throw error
+                }
+
+                let retryDelayNanoseconds = retryDelayNanosecondsForLLMAttempt(currentAttempt)
+                print("⚠️ LLM streaming transient error (attempt \(currentAttempt)/\(Self.maxLLMStreamingAttempts)): \(error.localizedDescription). Retrying...")
+
+                try await Task.sleep(nanoseconds: retryDelayNanoseconds)
+                currentAttempt += 1
+            }
+        }
+    }
+
+    /// Returns true for transient failures that usually succeed on retry.
+    private func shouldRetryLLMStreamingRequest(for error: Error) -> Bool {
+        if let urlError = error as? URLError {
+            switch urlError.code {
+            case .timedOut, .cannotFindHost, .cannotConnectToHost, .networkConnectionLost,
+                 .dnsLookupFailed, .notConnectedToInternet, .secureConnectionFailed,
+                 .internationalRoamingOff, .callIsActive, .dataNotAllowed:
+                return true
+            default:
+                return false
+            }
+        }
+
+        let nsError = error as NSError
+        if nsError.domain == "ClaudeAPI" {
+            let statusCode = nsError.code
+            if statusCode == 408 || statusCode == 429 || (500...599).contains(statusCode) {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    private func retryDelayNanosecondsForLLMAttempt(_ attemptNumber: Int) -> UInt64 {
+        let baseDelaySeconds = 0.6
+        let exponentialBackoffMultiplier = pow(2.0, Double(attemptNumber - 1))
+        let delaySeconds = baseDelaySeconds * exponentialBackoffMultiplier
+        return UInt64(delaySeconds * 1_000_000_000)
     }
 
     /// Speaks a hardcoded error message using macOS system TTS when API
