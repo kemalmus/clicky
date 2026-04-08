@@ -5,12 +5,15 @@
  * ships with raw API keys. Keys are stored as Cloudflare secrets.
  *
  * Routes:
- *   POST /chat  → Anthropic Messages API (streaming)
+ *   POST /chat-openrouter → OpenRouter Anthropic-compatible Messages API (streaming, default)
+ *   POST /chat  → Anthropic Messages API (streaming, optional)
  *   POST /tts   → ElevenLabs TTS API
  */
 
 interface Env {
   ANTHROPIC_API_KEY: string;
+  OPENROUTER_API_KEY?: string;
+  OPENROUTER_API_URL?: string;
   ELEVENLABS_API_KEY: string;
   ELEVENLABS_VOICE_ID: string;
   ASSEMBLYAI_API_KEY: string;
@@ -27,6 +30,10 @@ export default {
     try {
       if (url.pathname === "/chat") {
         return await handleChat(request, env);
+      }
+
+      if (url.pathname === "/chat-openrouter") {
+        return await handleOpenRouterChat(request, env);
       }
 
       if (url.pathname === "/tts") {
@@ -64,6 +71,44 @@ async function handleChat(request: Request, env: Env): Promise<Response> {
   if (!response.ok) {
     const errorBody = await response.text();
     console.error(`[/chat] Anthropic API error ${response.status}: ${errorBody}`);
+    return new Response(errorBody, {
+      status: response.status,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  return new Response(response.body, {
+    status: response.status,
+    headers: {
+      "content-type": response.headers.get("content-type") || "text/event-stream",
+      "cache-control": "no-cache",
+    },
+  });
+}
+
+async function handleOpenRouterChat(request: Request, env: Env): Promise<Response> {
+  if (!env.OPENROUTER_API_KEY) {
+    return new Response(
+      JSON.stringify({ error: "OPENROUTER_API_KEY is not configured" }),
+      { status: 500, headers: { "content-type": "application/json" } }
+    );
+  }
+
+  const body = await request.text();
+  const openRouterAPIURL = env.OPENROUTER_API_URL || "https://openrouter.ai/api/v1/anthropic/messages";
+
+  const response = await fetch(openRouterAPIURL, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${env.OPENROUTER_API_KEY}`,
+      "content-type": "application/json",
+    },
+    body,
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    console.error(`[/chat-openrouter] OpenRouter API error ${response.status}: ${errorBody}`);
     return new Response(errorBody, {
       status: response.status,
       headers: { "content-type": "application/json" },
