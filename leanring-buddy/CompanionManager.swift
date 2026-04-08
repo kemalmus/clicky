@@ -578,6 +578,14 @@ final class CompanionManager: ObservableObject {
 
     // MARK: - AI Response Pipeline
 
+    private enum StreamingPipelineStep: String {
+        case claudeResponse = "claude_response"
+        case ttsPlayback = "tts_playback"
+    }
+
+    private let maxStreamingRetryAttempts = 3
+    private let retryBackoffBaseDelayNanoseconds: UInt64 = 750_000_000
+
     /// Captures a screenshot, sends it along with the transcript to Claude,
     /// and plays the response aloud via ElevenLabs TTS. The cursor stays in
     /// the spinner/processing state until TTS audio begins playing.
@@ -610,15 +618,19 @@ final class CompanionManager: ObservableObject {
                     (userPlaceholder: entry.userTranscript, assistantResponse: entry.assistantResponse)
                 }
 
-                let (fullResponseText, _) = try await claudeAPI.analyzeImageStreaming(
-                    images: labeledImages,
-                    systemPrompt: Self.companionVoiceResponseSystemPrompt,
-                    conversationHistory: historyForAPI,
-                    userPrompt: transcript,
-                    onTextChunk: { _ in
-                        // No streaming text display — spinner stays until TTS plays
-                    }
-                )
+                let (fullResponseText, _) = try await performStreamingPipelineStepWithRetry(
+                    step: .claudeResponse
+                ) {
+                    try await claudeAPI.analyzeImageStreaming(
+                        images: labeledImages,
+                        systemPrompt: Self.companionVoiceResponseSystemPrompt,
+                        conversationHistory: historyForAPI,
+                        userPrompt: transcript,
+                        onTextChunk: { _ in
+                            // No streaming text display — spinner stays until TTS plays
+                        }
+                    )
+                }
 
                 guard !Task.isCancelled else { return }
 
@@ -701,7 +713,9 @@ final class CompanionManager: ObservableObject {
                 // until the audio actually starts playing, then switch to responding.
                 if !spokenText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     do {
-                        try await elevenLabsTTSClient.speakText(spokenText)
+                        try await performStreamingPipelineStepWithRetry(step: .ttsPlayback) {
+                            try await elevenLabsTTSClient.speakText(spokenText)
+                        }
                         // speakText returns after player.play() — audio is now playing
                         voiceState = .responding
                     } catch {
@@ -723,6 +737,60 @@ final class CompanionManager: ObservableObject {
                 scheduleTransientHideIfNeeded()
             }
         }
+    }
+
+    /// Retries a streaming pipeline step when the failure is likely transient.
+    /// This keeps the companion from dropping the whole response flow on brief
+    /// network interruptions or upstream rate-limit spikes.
+    private func performStreamingPipelineStepWithRetry<T>(
+        step: StreamingPipelineStep,
+        operation: @escaping () async throws -> T
+    ) async throws -> T {
+        var attemptNumber = 1
+        while true {
+            do {
+                return try await operation()
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                let shouldRetry = shouldRetryStreamingPipelineStepError(error) && attemptNumber < maxStreamingRetryAttempts
+                guard shouldRetry else {
+                    throw error
+                }
+
+                let retryDelay = retryBackoffBaseDelayNanoseconds * UInt64(attemptNumber)
+                print("⚠️ Companion \(step.rawValue) attempt \(attemptNumber) failed: \(error.localizedDescription). Retrying...")
+                try? await Task.sleep(nanoseconds: retryDelay)
+                guard !Task.isCancelled else {
+                    throw CancellationError()
+                }
+                attemptNumber += 1
+            }
+        }
+    }
+
+    /// Returns true only for errors that have a reasonable chance of succeeding
+    /// on an immediate retry (timeouts, temporary disconnects, upstream 5xx, etc).
+    private func shouldRetryStreamingPipelineStepError(_ error: Error) -> Bool {
+        let nsError = error as NSError
+
+        if nsError.domain == NSURLErrorDomain {
+            let retryableNetworkErrorCodes: Set<Int> = [
+                NSURLErrorTimedOut,
+                NSURLErrorCannotConnectToHost,
+                NSURLErrorNetworkConnectionLost,
+                NSURLErrorNotConnectedToInternet,
+                NSURLErrorDNSLookupFailed
+            ]
+            return retryableNetworkErrorCodes.contains(nsError.code)
+        }
+
+        if nsError.domain == "ClaudeAPI" || nsError.domain == "ElevenLabsTTS" {
+            let retryableHTTPStatusCodes: Set<Int> = [408, 409, 425, 429, 500, 502, 503, 504]
+            return retryableHTTPStatusCodes.contains(nsError.code)
+        }
+
+        return false
     }
 
     /// If the cursor is in transient mode (user toggled "Show Clicky" off),
